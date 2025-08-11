@@ -2,3 +2,4 @@ pymysql
 flask
 pandas
 pdfplumber
+requests
