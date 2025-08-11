@@ -4,6 +4,7 @@ from pymysql import cursors
 def get_connection():
     return pymysql.connect(
         host="localhost",
+        port=3307,
         user="root",
         password="",
         database="smart_hub",
