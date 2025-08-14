@@ -1,91 +1,96 @@
-from langgraph.graph import StateGraph
-from typing import TypedDict, Optional
-from db import fetch_faq_answer,log_ai_response
-from mcp_client import parse_pdf
-import matplotlib.pyplot as plt
-import matplotlib.image as mpimg
 from io import BytesIO
+from typing import TypedDict, Optional, Literal, Dict, Any
+from langgraph.graph import StateGraph, START, END
+from matplotlib import image as mpimg, pyplot as plt
 
-class GraphState(TypedDict):
+
+class GraphState(TypedDict, total=False):
     user_query: str
     file_path: Optional[str]
-    intent: Optional[str]
-    ai_response: Optional[str]
+    file_kind: Optional[Literal["csv","pdf","other"]]
+    db_result: Optional[str]
+    extracted: Optional[str]
+    response: Optional[str]
+    route: Optional[str]
 
-# --- Node: Intent Classifier ---
-def classify_intent(state: GraphState):
-    query = state["user_query"].lower()
-    if state["file_path"]:
-        intent = "document"
-    elif any(keyword in query for keyword in ["order", "return", "price", "policy"]):
-        intent = "faq"
-    else:
-        intent = "unknown"
-    return {**state, "intent": intent}
+def classify_intent(state: GraphState) -> Dict[str, Any]:
+    q = (state.get("user_query") or "").lower()
+    if state.get("file_path"):
+        return {"route": "file"}
+    if any(k in q for k in ["order", "hours", "track", "status", "faq", "price"]):
+        return {"route": "faq"}
+    return {"route": "fallback"}
 
-# --- Node: FAQ Agent ---
-def faq_agent_node(state: GraphState):
-    answer = fetch_faq_answer(state["user_query"])
-    if not answer:
-        answer = "I couldn't find an exact answer."
-    return {**state, "ai_response": answer}
+def faq_lookup(state: GraphState, db_lookup_fn) -> Dict[str, Any]:
+    question = state.get("user_query","")
+    answer = db_lookup_fn(question)
+    if answer:
+        return {"db_result": answer}
+    return {"db_result": "Sorry, I couldn't find an exact answer. A support ticket may be needed."}
 
-# --- Node: Document Agent ---
-def document_agent_node(state: GraphState):
-    content = parse_pdf(state["file_path"])
-    preview = content[:300] + "..." if len(content) > 300 else content
-    return {**state, "ai_response": f"Extracted content preview:\n{preview}"}
+async def process_file(state: GraphState, mcp_client) -> Dict[str, Any]:
+    path = state.get("file_path")
+    kind = state.get("file_kind","other")
+    if not path:
+        return {}
+    if kind == "csv":
+        data = await mcp_client.call("parse_csv", {"path": path})
+        text = f"CSV parsed. Columns: {', '.join(data.get('columns', []))}. Rows: {data.get('rows', 'unknown')}."
+        return {"extracted": text}
+    elif kind == "pdf":
+        text = await mcp_client.call("extract_pdf_text", {"path": path, "max_pages": 3})
+        return {"extracted": (text or "")[:1200]}
+    return {"extracted": "Unsupported file type."}
 
-# --- Node: Fallback for Unknown ---
-def unknown_agent_node(state: GraphState):
-    return {**state, "ai_response": "I'm not sure how to handle this request yet."}
+def craft_response(state: GraphState) -> Dict[str, Any]:
+    if state.get("file_path"):
+        return {"response": f"File processed ({state.get('file_kind')}): {state.get('extracted')}"}
+    if state.get("db_result"):
+        return {"response": state["db_result"]}
+    return {"response": "How can I help you today? You can ask about business hours or upload a CSV/PDF to parse."}
 
-# --- Node: Final Response Logger ---
-def log_and_return(state: GraphState):
-    log_ai_response(state["user_query"], state["ai_response"])
-    return state
+def build_workflow(db_lookup_fn, mcp_client):
+    graph = StateGraph(GraphState)
 
-# --- Build Graph ---
-workflow = StateGraph(GraphState)
+    def node_route(state: GraphState):
+        return classify_intent(state)
 
-workflow.add_node("classify_intent", classify_intent)
-workflow.add_node("faq_agent", faq_agent_node)
-workflow.add_node("document_agent", document_agent_node)
-workflow.add_node("unknown_agent", unknown_agent_node)
-workflow.add_node("log_and_return", log_and_return)
+    def node_faq(state: GraphState):
+        return faq_lookup(state, db_lookup_fn)
 
-# Entry point
-workflow.set_entry_point("classify_intent")
+    async def node_file(state: GraphState):
+        return await process_file(state, mcp_client)
 
-# Edges
-def route_intent(state: GraphState):
-    if state["intent"] == "faq":
-        return "faq_agent"
-    elif state["intent"] == "document":
-        return "document_agent"
-    else:
-        return "unknown_agent"
+    def node_finalize(state: GraphState):
+        return craft_response(state)
 
-workflow.add_conditional_edges(
-    "classify_intent",
-    route_intent,
-    {
-        "faq_agent": "faq_agent",
-        "document_agent": "document_agent",
-        "unknown_agent": "unknown_agent"
-    }
-)
+    graph.add_node("router", node_route)
+    graph.add_node("faq", node_faq)
+    graph.add_node("file", node_file)
+    graph.add_node("finalize", node_finalize)
 
-# All agents → final log node
-workflow.add_edge("faq_agent", "log_and_return")
-workflow.add_edge("document_agent", "log_and_return")
-workflow.add_edge("unknown_agent", "log_and_return")
+    graph.add_edge(START, "router")
 
-# Compile
-graph = workflow.compile()
+    def route_switch(state: GraphState):
+        return state.get("route","fallback")
 
-graph_image = graph.get_graph().draw_mermaid_png()
-img = mpimg.imread(BytesIO(graph_image))
-plt.imshow(img)
-plt.axis('off')
-plt.show()
+    graph.add_conditional_edges("router", route_switch, {
+        "file": "file",
+        "faq": "faq",
+        "fallback": "finalize"
+    })
+    graph.add_edge("faq", "finalize")
+    graph.add_edge("file", "finalize")
+    graph.add_edge("finalize", END)
+    graphs = graph.compile()
+
+    graph_image = graphs.get_graph().draw_mermaid_png()
+    img = mpimg.imread(BytesIO(graph_image))
+    plt.imshow(img)
+    plt.axis('off')
+    plt.show()
+
+    return graphs
+
+
+
