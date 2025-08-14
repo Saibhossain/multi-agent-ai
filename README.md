@@ -46,8 +46,8 @@ Key Features:
 
 ### 1️⃣ Clone Repository
 ```bash
-git clone https://github.com/<your-username>/langgraph-mcp-xampp-agent.git
-cd langgraph-mcp-xampp-agent
+git clone https://github.com/Saibhossain/multi-agent-ai.git
+cd multi-agent-ai
 ```
 ### 2️⃣ Create Virtual Environment
 ```bash
